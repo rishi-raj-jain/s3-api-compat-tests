@@ -208,7 +208,7 @@ func testPutBucketLifecycle(ctx context.Context, env *Env) TestResult {
 				{
 					ID:     aws.String("expire-test"),
 					Status: types.ExpirationStatusEnabled,
-					Filter: &types.LifecycleRuleFilterMemberPrefix{Value: "expire/"},
+					Filter: &types.LifecycleRuleFilter{Prefix: aws.String("expire/")},
 					Expiration: &types.LifecycleExpiration{
 						Days: aws.Int32(30),
 					},
@@ -236,7 +236,7 @@ func testGetBucketLifecycle(ctx context.Context, env *Env) TestResult {
 }
 
 func testDeleteBucketLifecycle(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.DeleteBucketLifecycleConfiguration(ctx, &s3.DeleteBucketLifecycleConfigurationInput{
+	_, err := env.Client.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{
 		Bucket: aws.String(env.Bucket),
 	})
 	if err != nil {

@@ -9,6 +9,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Provider describes one S3-compatible service to test against.
@@ -19,6 +21,31 @@ type Provider struct {
 	PathStyle bool
 	AccessKey string
 	SecretKey string
+
+	// StripSDKHeaders removes amz-sdk-* and accept-encoding headers before
+	// signing. GCS rejects requests signed with headers it doesn't understand.
+	StripSDKHeaders bool
+}
+
+// stripSDKHeadersMiddleware removes SDK-specific headers before signing.
+// The retry handler adds Amz-Sdk-* headers in the Finalize step, so this
+// middleware must also run in Finalize, before the signer.
+type stripSDKHeadersMiddleware struct{}
+
+func (stripSDKHeadersMiddleware) ID() string { return "StripSDKHeaders" }
+
+func (stripSDKHeadersMiddleware) HandleFinalize(
+	ctx context.Context,
+	in middleware.FinalizeInput,
+	next middleware.FinalizeHandler,
+) (middleware.FinalizeOutput, middleware.Metadata, error) {
+	req, ok := in.Request.(*smithyhttp.Request)
+	if ok {
+		req.Header.Del("Accept-Encoding")
+		req.Header.Del("Amz-Sdk-Invocation-Id")
+		req.Header.Del("Amz-Sdk-Request")
+	}
+	return next.HandleFinalize(ctx, in)
 }
 
 // NewClient builds an s3.Client for this provider.
@@ -38,6 +65,17 @@ func (p *Provider) NewClient(ctx context.Context) (*s3.Client, error) {
 		}
 		o.UsePathStyle = p.PathStyle
 		o.Region = p.Region
+		o.DisableLogOutputChecksumValidationSkipped = true
+		if p.StripSDKHeaders {
+			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+				// Try to insert before "Signing" (normal client) or just add
+				// at the start of Finalize (presign client has no Signing).
+				if err := stack.Finalize.Insert(stripSDKHeadersMiddleware{}, "Signing", middleware.Before); err != nil {
+					return stack.Finalize.Add(stripSDKHeadersMiddleware{}, middleware.Before)
+				}
+				return nil
+			})
+		}
 	}), nil
 }
 
@@ -59,8 +97,8 @@ func LoadProviders(names []string) []Provider {
 			Endpoint:  "https://t3.storage.dev",
 			Region:    "auto",
 			PathStyle: false,
-			AccessKey: os.Getenv("TIGRIS_ACCESS_KEY_ID"),
-			SecretKey: os.Getenv("TIGRIS_SECRET_ACCESS_KEY"),
+			AccessKey: firstEnv("TIGRIS_ACCESS_KEY_ID", "TIGRIS_STORAGE_ACCESS_KEY_ID"),
+			SecretKey: firstEnv("TIGRIS_SECRET_ACCESS_KEY", "TIGRIS_STORAGE_SECRET_ACCESS_KEY"),
 		},
 		{
 			Name:      "aws",
@@ -72,19 +110,20 @@ func LoadProviders(names []string) []Provider {
 		},
 		{
 			Name:      "r2",
-			Endpoint:  os.Getenv("R2_ENDPOINT"),
+			Endpoint:  firstEnv("R2_ENDPOINT", "CLOUDFLARE_ENDPOINT"),
 			Region:    "auto",
 			PathStyle: false,
-			AccessKey: os.Getenv("R2_ACCESS_KEY_ID"),
-			SecretKey: os.Getenv("R2_SECRET_ACCESS_KEY"),
+			AccessKey: firstEnv("R2_ACCESS_KEY_ID", "CLOUDFLARE_ACCESS_KEY_ID"),
+			SecretKey: firstEnv("R2_SECRET_ACCESS_KEY", "CLOUDFLARE_SECRET_ACCESS_KEY"),
 		},
 		{
-			Name:      "gcs",
-			Endpoint:  "https://storage.googleapis.com",
-			Region:    "us-central1",
-			PathStyle: true,
-			AccessKey: os.Getenv("GCS_ACCESS_KEY_ID"),
-			SecretKey: os.Getenv("GCS_SECRET_ACCESS_KEY"),
+			Name:            "gcs",
+			Endpoint:        "https://storage.googleapis.com",
+			Region:          "auto",
+			PathStyle:       true,
+			AccessKey:       os.Getenv("GCS_ACCESS_KEY_ID"),
+			SecretKey:       os.Getenv("GCS_SECRET_ACCESS_KEY"),
+			StripSDKHeaders: true,
 		},
 	}
 
@@ -112,4 +151,14 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// firstEnv returns the value of the first non-empty env var.
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }
