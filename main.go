@@ -129,7 +129,42 @@ func runProvider(ctx context.Context, p *Provider) ProviderReport {
 }
 
 func cleanupBucket(ctx context.Context, client *s3.Client, bucket string) {
-	// Delete all objects.
+	// Delete all object versions and delete markers first. Versioned buckets
+	// (e.g. AWS S3 after enabling versioning in the test suite) will not
+	// delete unless every version is removed by VersionId. Providers that
+	// do not support versioning return an empty list here.
+	versionsPaginator := s3.NewListObjectVersionsPaginator(client, &s3.ListObjectVersionsInput{
+		Bucket: aws.String(bucket),
+	})
+	for versionsPaginator.HasMorePages() {
+		page, err := versionsPaginator.NextPage(ctx)
+		if err != nil {
+			break
+		}
+		var objects []types.ObjectIdentifier
+		for _, v := range page.Versions {
+			objects = append(objects, types.ObjectIdentifier{
+				Key:       v.Key,
+				VersionId: v.VersionId,
+			})
+		}
+		for _, m := range page.DeleteMarkers {
+			objects = append(objects, types.ObjectIdentifier{
+				Key:       m.Key,
+				VersionId: m.VersionId,
+			})
+		}
+		if len(objects) == 0 {
+			continue
+		}
+		_, _ = client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(bucket),
+			Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+		})
+	}
+
+	// Delete remaining current objects (covers providers that don't expose
+	// ListObjectVersions, and any objects the version-aware sweep missed).
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 	})

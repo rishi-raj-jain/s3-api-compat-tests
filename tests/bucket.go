@@ -334,22 +334,69 @@ func testPutBucketVersioning(ctx context.Context, env *Env) TestResult {
 }
 
 func testGetBucketVersioning(ctx context.Context, env *Env) TestResult {
+	// Enable versioning, then verify Get returns the configured status.
+	// A provider that silently no-ops PutBucketVersioning will return an
+	// empty status here and fail this assertion.
+	_, err := env.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket: aws.String(env.Bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{
+			Status: types.BucketVersioningStatusEnabled,
+		},
+	})
+	if err != nil {
+		return Fail("PutBucketVersioning: " + err.Error())
+	}
+
 	out, err := env.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 		Bucket: aws.String(env.Bucket),
 	})
 	if err != nil {
 		return Fail(err.Error())
 	}
-	_ = out.Status // may be empty if never enabled
+	if out.Status != types.BucketVersioningStatusEnabled {
+		return Fail(fmt.Sprintf("expected status Enabled, got %q", out.Status))
+	}
 	return Pass()
 }
 
 func testListObjectVersions(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+	// Enable versioning, write the same key twice, and assert the listing
+	// returns both versions. Providers without real versioning support
+	// return an empty list and fail.
+	_, err := env.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
 		Bucket: aws.String(env.Bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{
+			Status: types.BucketVersioningStatusEnabled,
+		},
+	})
+	if err != nil {
+		return Fail("PutBucketVersioning: " + err.Error())
+	}
+
+	key := "test-versions"
+	if err := putTestObject(ctx, env, key); err != nil {
+		return Error("setup put 1: " + err.Error())
+	}
+	if err := putTestObject(ctx, env, key); err != nil {
+		return Error("setup put 2: " + err.Error())
+	}
+
+	out, err := env.Client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String(env.Bucket),
+		Prefix: aws.String(key),
 	})
 	if err != nil {
 		return Fail(err.Error())
+	}
+
+	count := 0
+	for _, v := range out.Versions {
+		if aws.ToString(v.Key) == key {
+			count++
+		}
+	}
+	if count < 2 {
+		return Fail(fmt.Sprintf("expected at least 2 versions for key %q, got %d", key, count))
 	}
 	return Pass()
 }
