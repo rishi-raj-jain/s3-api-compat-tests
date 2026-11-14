@@ -60,7 +60,7 @@ go run . --providers=tigris --tests=PutObject,GetObject,RenameObject
 go run . --providers=tigris --output=tigris-results.json
 ```
 
-Each run creates a bucket named `s3compat-<provider>-<random>` and a second bucket `…-v` with object versioning enabled, runs every test, and deletes both buckets.
+Each run creates a bucket named `s3compat-<provider>-<random>` and a second bucket `…-v` with object versioning enabled, runs every test, and deletes both buckets. Every test creates what it needs and cleans up after itself, so any subset selected with `--tests` runs on its own.
 
 ## How the versioned bucket is created
 

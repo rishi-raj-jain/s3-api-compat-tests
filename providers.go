@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -60,18 +61,19 @@ func (stripSDKHeadersMiddleware) HandleFinalize(
 		req.Header.Del("Accept-Encoding")
 		req.Header.Del("Amz-Sdk-Invocation-Id")
 		req.Header.Del("Amz-Sdk-Request")
-		// The SDK's default request checksum for operations that require one;
-		// GCS does not know these headers. GCS wants Content-MD5 on those
-		// operations instead, so compute it from the body before stripping.
-		hadChecksum := false
-		for h := range req.Header {
-			if strings.HasPrefix(strings.ToLower(h), "x-amz-checksum-") {
-				req.Header.Del(h)
-				hadChecksum = true
+		// The SDK adds a CRC32 checksum to operations that require one; GCS
+		// does not know that header and wants Content-MD5 instead, so compute
+		// the MD5 from the body and drop the SDK's default. A checksum a test
+		// sets on purpose (SHA-256) is left as sent.
+		hadDefault := false
+		if req.Header.Get("X-Amz-Checksum-Crc32") != "" {
+			req.Header.Del("X-Amz-Checksum-Crc32")
+			hadDefault = true
+			if strings.EqualFold(req.Header.Get("X-Amz-Sdk-Checksum-Algorithm"), "CRC32") {
+				req.Header.Del("X-Amz-Sdk-Checksum-Algorithm")
 			}
 		}
-		req.Header.Del("X-Amz-Sdk-Checksum-Algorithm")
-		if hadChecksum && req.Header.Get("Content-Md5") == "" {
+		if hadDefault && req.Header.Get("Content-Md5") == "" {
 			if stream := req.GetStream(); stream != nil {
 				if body, err := io.ReadAll(stream); err == nil {
 					sum := md5.Sum(body)
@@ -152,14 +154,26 @@ func (p *Provider) CreateVersionedBucket(ctx context.Context, client *s3.Client,
 			return fmt.Errorf("enable versioning: %w", err)
 		}
 	}
-	out, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(name)})
-	if err != nil {
-		return fmt.Errorf("get versioning: %w", err)
+	// Bucket settings are eventually consistent on S3, so read the status
+	// back for a while before deciding the bucket has no versioning.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		out, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(name)})
+		if err == nil && out.Status == types.BucketVersioningStatusEnabled {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("get versioning: %w", err)
+			}
+			return fmt.Errorf("versioning status is %q after enabling", out.Status)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	if out.Status != types.BucketVersioningStatusEnabled {
-		return fmt.Errorf("versioning status is %q after enabling", out.Status)
-	}
-	return nil
 }
 
 // LoadProviders reads env vars and returns providers that have credentials configured.

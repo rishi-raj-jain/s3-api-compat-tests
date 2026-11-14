@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+// Every test creates the object it needs, so any subset can run with --tests.
 func PresignedTests() []TestDef {
 	return []TestDef{
 		{"PresignPutObject", "presigned", testPresignPutObject},
@@ -29,7 +30,14 @@ var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 const presignBody = "presigned put content"
 
-func doPresigned(ctx context.Context, p *v4PresignedHTTPRequest, body io.Reader, length int64) (*http.Response, error) {
+// presignedRequest holds the parts of a presigned request the tests send.
+type presignedRequest struct {
+	URL          string
+	Method       string
+	SignedHeader http.Header
+}
+
+func doPresigned(ctx context.Context, p presignedRequest, body io.Reader, length int64) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, p.Method, p.URL, body)
 	if err != nil {
 		return nil, err
@@ -45,15 +53,9 @@ func doPresigned(ctx context.Context, p *v4PresignedHTTPRequest, body io.Reader,
 	return httpClient.Do(req)
 }
 
-// v4PresignedHTTPRequest holds the parts of a presigned request the tests send.
-type v4PresignedHTTPRequest struct {
-	URL          string
-	Method       string
-	SignedHeader http.Header
-}
-
 func testPresignPutObject(ctx context.Context, env *Env) TestResult {
 	key := "presign-put"
+	defer deleteObject(ctx, env, key)
 	presigned, err := env.PresignClient.PresignPutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(env.Bucket),
 		Key:    aws.String(key),
@@ -62,7 +64,7 @@ func testPresignPutObject(ctx context.Context, env *Env) TestResult {
 		return Fail(err.Error())
 	}
 
-	resp, err := doPresigned(ctx, &v4PresignedHTTPRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, strings.NewReader(presignBody), int64(len(presignBody)))
+	resp, err := doPresigned(ctx, presignedRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, strings.NewReader(presignBody), int64(len(presignBody)))
 	if err != nil {
 		return Fail("http: " + err.Error())
 	}
@@ -74,12 +76,15 @@ func testPresignPutObject(ctx context.Context, env *Env) TestResult {
 	if err != nil || body != presignBody {
 		return Fail(fmt.Sprintf("object not stored through the presigned PUT: %q %v", body, err))
 	}
-	// Don't delete — used by PresignGetObject, PresignHeadObject, PresignDeleteObject.
 	return Pass()
 }
 
 func testPresignGetObject(ctx context.Context, env *Env) TestResult {
-	key := "presign-put"
+	key := "presign-get"
+	if _, err := putBody(ctx, env, env.Bucket, key, presignBody); err != nil {
+		return Error("setup: " + err.Error())
+	}
+	defer deleteObject(ctx, env, key)
 	presigned, err := env.PresignClient.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(env.Bucket),
 		Key:    aws.String(key),
@@ -88,7 +93,7 @@ func testPresignGetObject(ctx context.Context, env *Env) TestResult {
 		return Fail(err.Error())
 	}
 
-	resp, err := doPresigned(ctx, &v4PresignedHTTPRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, nil, -1)
+	resp, err := doPresigned(ctx, presignedRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, nil, -1)
 	if err != nil {
 		return Fail("http: " + err.Error())
 	}
@@ -104,7 +109,11 @@ func testPresignGetObject(ctx context.Context, env *Env) TestResult {
 }
 
 func testPresignHeadObject(ctx context.Context, env *Env) TestResult {
-	key := "presign-put"
+	key := "presign-head"
+	if _, err := putBody(ctx, env, env.Bucket, key, presignBody); err != nil {
+		return Error("setup: " + err.Error())
+	}
+	defer deleteObject(ctx, env, key)
 	presigned, err := env.PresignClient.PresignHeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(env.Bucket),
 		Key:    aws.String(key),
@@ -113,7 +122,7 @@ func testPresignHeadObject(ctx context.Context, env *Env) TestResult {
 		return Fail(err.Error())
 	}
 
-	resp, err := doPresigned(ctx, &v4PresignedHTTPRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, nil, -1)
+	resp, err := doPresigned(ctx, presignedRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, nil, -1)
 	if err != nil {
 		return Fail("http: " + err.Error())
 	}
@@ -128,7 +137,11 @@ func testPresignHeadObject(ctx context.Context, env *Env) TestResult {
 }
 
 func testPresignDeleteObject(ctx context.Context, env *Env) TestResult {
-	key := "presign-put"
+	key := "presign-delete"
+	if _, err := putBody(ctx, env, env.Bucket, key, presignBody); err != nil {
+		return Error("setup: " + err.Error())
+	}
+	defer deleteObject(ctx, env, key)
 	presigned, err := env.PresignClient.PresignDeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(env.Bucket),
 		Key:    aws.String(key),
@@ -137,7 +150,7 @@ func testPresignDeleteObject(ctx context.Context, env *Env) TestResult {
 		return Fail(err.Error())
 	}
 
-	resp, err := doPresigned(ctx, &v4PresignedHTTPRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, nil, -1)
+	resp, err := doPresigned(ctx, presignedRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, nil, -1)
 	if err != nil {
 		return Fail("http: " + err.Error())
 	}
@@ -171,7 +184,7 @@ func testPresignUploadPart(ctx context.Context, env *Env) TestResult {
 	}
 
 	part := bytes.Repeat([]byte("p"), partSize)
-	resp, err := doPresigned(ctx, &v4PresignedHTTPRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, bytes.NewReader(part), int64(len(part)))
+	resp, err := doPresigned(ctx, presignedRequest{presigned.URL, presigned.Method, presigned.SignedHeader}, bytes.NewReader(part), int64(len(part)))
 	if err != nil {
 		return Fail("http: " + err.Error())
 	}
@@ -185,8 +198,11 @@ func testPresignUploadPart(ctx context.Context, env *Env) TestResult {
 	list, err := env.Client.ListParts(ctx, &s3.ListPartsInput{
 		Bucket: aws.String(env.Bucket), Key: aws.String(key), UploadId: create.UploadId,
 	})
-	if err != nil || len(list.Parts) != 1 {
-		return Fail(fmt.Sprintf("part not listed after the presigned upload: %v", err))
+	if err != nil {
+		return Fail("ListParts after the presigned upload: " + err.Error())
+	}
+	if len(list.Parts) != 1 || aws.ToInt64(list.Parts[0].Size) != int64(partSize) {
+		return Fail(fmt.Sprintf("part not listed as uploaded: %+v", list.Parts))
 	}
 	return Pass()
 }

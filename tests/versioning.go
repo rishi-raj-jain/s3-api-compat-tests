@@ -153,7 +153,8 @@ func testPutObjectVersioned(ctx context.Context, env *Env) TestResult {
 	}
 	key := "ver-put"
 	defer deleteAllVersions(ctx, env, key)
-	if _, _, err := putTwoVersions(ctx, env, key); err != nil {
+	_, v2, err := putTwoVersions(ctx, env, key)
+	if err != nil {
 		return Fail(err.Error())
 	}
 	out, err := env.Client.GetObject(ctx, &s3.GetObjectInput{
@@ -167,8 +168,8 @@ func testPutObjectVersioned(ctx context.Context, env *Env) TestResult {
 	if string(b) != "v2" {
 		return Fail(fmt.Sprintf("current version body %q, want v2", string(b)))
 	}
-	if aws.ToString(out.VersionId) == "" {
-		return Fail("GetObject of the current version returned no x-amz-version-id")
+	if aws.ToString(out.VersionId) != v2 {
+		return Fail(fmt.Sprintf("GetObject of the current version reported x-amz-version-id %q, want %s", aws.ToString(out.VersionId), v2))
 	}
 	return Pass()
 }
@@ -237,15 +238,13 @@ func testListObjectVersions(ctx context.Context, env *Env) TestResult {
 		return Fail(err.Error())
 	}
 	var ids []string
-	latest := 0
+	latest := map[string]bool{}
 	for _, v := range out.Versions {
 		if aws.ToString(v.Key) != key {
 			continue
 		}
 		ids = append(ids, aws.ToString(v.VersionId))
-		if aws.ToBool(v.IsLatest) {
-			latest++
-		}
+		latest[aws.ToString(v.VersionId)] = aws.ToBool(v.IsLatest)
 	}
 	if len(ids) != 2 {
 		return Fail(fmt.Sprintf("expected 2 versions, got %v", ids))
@@ -253,8 +252,8 @@ func testListObjectVersions(ctx context.Context, env *Env) TestResult {
 	if ids[0] != v2 || ids[1] != v1 {
 		return Fail(fmt.Sprintf("versions not newest-first: got %v, want [%s %s]", ids, v2, v1))
 	}
-	if latest != 1 {
-		return Fail(fmt.Sprintf("expected exactly one IsLatest, got %d", latest))
+	if !latest[v2] || latest[v1] {
+		return Fail(fmt.Sprintf("IsLatest must be set on %s only: v2=%v v1=%v", v2, latest[v2], latest[v1]))
 	}
 	return Pass()
 }
@@ -334,16 +333,17 @@ func testPutObjectTaggingVersionId(ctx context.Context, env *Env) TestResult {
 	list, err := env.Client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
 		Bucket: aws.String(env.VersionedBucket), Prefix: aws.String(key),
 	})
-	if err == nil {
-		n := 0
-		for _, v := range list.Versions {
-			if aws.ToString(v.Key) == key {
-				n++
-			}
+	if err != nil {
+		return Fail("ListObjectVersions after tagging: " + err.Error())
+	}
+	n := 0
+	for _, v := range list.Versions {
+		if aws.ToString(v.Key) == key {
+			n++
 		}
-		if n != 2 {
-			return Fail(fmt.Sprintf("tagging created a version: %d versions, want 2", n))
-		}
+	}
+	if n != 2 {
+		return Fail(fmt.Sprintf("tagging created a version: %d versions, want 2", n))
 	}
 	return Pass()
 }

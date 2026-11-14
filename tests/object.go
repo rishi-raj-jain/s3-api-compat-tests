@@ -97,6 +97,37 @@ func getObjectBody(ctx context.Context, env *Env, key string) (string, error) {
 	return string(b), err
 }
 
+// bodyMD5 returns the hex MD5 of the stored object, read in full.
+func bodyMD5(ctx context.Context, env *Env, key string) (string, error) {
+	out, err := env.Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(env.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return "", err
+	}
+	defer out.Body.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, out.Body); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func repeatMD5(fill byte, n int) string {
+	h := md5.New()
+	chunk := bytes.Repeat([]byte{fill}, 64*1024)
+	for n > 0 {
+		k := len(chunk)
+		if n < k {
+			k = n
+		}
+		_, _ = h.Write(chunk[:k])
+		n -= k
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func headObject(ctx context.Context, env *Env, key string) (*s3.HeadObjectOutput, error) {
 	return env.Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(env.Bucket),
@@ -313,6 +344,10 @@ func testCopyObjectIfMatch(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail("matching if-match: " + err.Error())
 	}
+	body, err := getObjectBody(ctx, env, dst)
+	if err != nil || body != testBody {
+		return Fail(fmt.Sprintf("copy with a matching condition did not store the body: %q %v", body, err))
+	}
 	_, err = env.Client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:            aws.String(env.Bucket),
 		CopySource:        aws.String(env.Bucket + "/" + src),
@@ -346,12 +381,12 @@ func testCopyObjectMultipartSource(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	head, err := headObject(ctx, env, dst)
+	got, err := bodyMD5(ctx, env, dst)
 	if err != nil {
-		return Fail("head copy: " + err.Error())
+		return Fail("read copy: " + err.Error())
 	}
-	if aws.ToInt64(head.ContentLength) != int64(2*partSize) {
-		return Fail(fmt.Sprintf("copy length mismatch: got %d", aws.ToInt64(head.ContentLength)))
+	if got != twoPartMD5() {
+		return Fail("copied bytes differ from the source")
 	}
 	return Pass()
 }
@@ -686,10 +721,8 @@ func testPutObjectBadChecksumSHA256(ctx context.Context, env *Env) TestResult {
 	if r := expectFailure(err, "PUT with a wrong x-amz-checksum-sha256", 400, "BadDigest", "InvalidRequest", "XAmzContentSHA256Mismatch"); r.Status != StatusPass {
 		return r
 	}
-	if _, err := headObject(ctx, env, key); err == nil {
-		return Fail("object stored although the checksum was wrong")
-	}
-	return Pass()
+	_, err = headObject(ctx, env, key)
+	return expectFailure(err, "HeadObject after a rejected PUT", 404, "NotFound", "NoSuchKey")
 }
 
 // The SSE-S3 header is honoured when HeadObject reports it back.
@@ -742,13 +775,7 @@ func testPutObjectStorageClass(ctx context.Context, env *Env) TestResult {
 	return Pass()
 }
 
-func testPutObjectTagging(ctx context.Context, env *Env) TestResult {
-	key := "test-obj-tagging"
-	if err := putTestObject(ctx, env, key); err != nil {
-		return Error("setup: " + err.Error())
-	}
-	// Don't delete — used by GetObjectTagging and DeleteObjectTagging tests.
-
+func putTag(ctx context.Context, env *Env, key string) error {
 	_, err := env.Client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
 		Bucket: aws.String(env.Bucket),
 		Key:    aws.String(key),
@@ -758,7 +785,17 @@ func testPutObjectTagging(ctx context.Context, env *Env) TestResult {
 			},
 		},
 	})
-	if err != nil {
+	return err
+}
+
+func testPutObjectTagging(ctx context.Context, env *Env) TestResult {
+	key := "test-obj-tagging-put"
+	if err := putTestObject(ctx, env, key); err != nil {
+		return Error("setup: " + err.Error())
+	}
+	defer deleteObject(ctx, env, key)
+
+	if err := putTag(ctx, env, key); err != nil {
 		return Fail(err.Error())
 	}
 	tags, err := getTags(ctx, env, key)
@@ -772,7 +809,14 @@ func testPutObjectTagging(ctx context.Context, env *Env) TestResult {
 }
 
 func testGetObjectTagging(ctx context.Context, env *Env) TestResult {
-	key := "test-obj-tagging"
+	key := "test-obj-tagging-get"
+	if err := putTestObject(ctx, env, key); err != nil {
+		return Error("setup: " + err.Error())
+	}
+	defer deleteObject(ctx, env, key)
+	if err := putTag(ctx, env, key); err != nil {
+		return Error("setup tags: " + err.Error())
+	}
 	tags, err := getTags(ctx, env, key)
 	if err != nil {
 		return Fail(err.Error())
@@ -784,8 +828,14 @@ func testGetObjectTagging(ctx context.Context, env *Env) TestResult {
 }
 
 func testDeleteObjectTagging(ctx context.Context, env *Env) TestResult {
-	key := "test-obj-tagging"
+	key := "test-obj-tagging-delete"
+	if err := putTestObject(ctx, env, key); err != nil {
+		return Error("setup: " + err.Error())
+	}
 	defer deleteObject(ctx, env, key)
+	if err := putTag(ctx, env, key); err != nil {
+		return Error("setup tags: " + err.Error())
+	}
 
 	_, err := env.Client.DeleteObjectTagging(ctx, &s3.DeleteObjectTaggingInput{
 		Bucket: aws.String(env.Bucket),
@@ -805,11 +855,11 @@ func testDeleteObjectTagging(ctx context.Context, env *Env) TestResult {
 }
 
 func testPutObjectAcl(ctx context.Context, env *Env) TestResult {
-	key := "test-obj-acl"
+	key := "test-obj-acl-put"
 	if err := putTestObject(ctx, env, key); err != nil {
 		return Error("setup: " + err.Error())
 	}
-	// Don't delete — used by GetObjectAcl test.
+	defer deleteObject(ctx, env, key)
 
 	_, err := env.Client.PutObjectAcl(ctx, &s3.PutObjectAclInput{
 		Bucket: aws.String(env.Bucket),
@@ -833,7 +883,10 @@ func testPutObjectAcl(ctx context.Context, env *Env) TestResult {
 }
 
 func testGetObjectAcl(ctx context.Context, env *Env) TestResult {
-	key := "test-obj-acl"
+	key := "test-obj-acl-get"
+	if err := putTestObject(ctx, env, key); err != nil {
+		return Error("setup: " + err.Error())
+	}
 	defer deleteObject(ctx, env, key)
 
 	out, err := env.Client.GetObjectAcl(ctx, &s3.GetObjectAclInput{
@@ -954,8 +1007,8 @@ func testListObjectsV2Pagination(ctx context.Context, env *Env) TestResult {
 		}
 		token = out.NextContinuationToken
 	}
-	if len(seen) != 3 {
-		return Fail(fmt.Sprintf("pagination returned %d keys, want 3: %v", len(seen), seen))
+	if strings.Join(seen, ",") != strings.Join(keys, ",") {
+		return Fail(fmt.Sprintf("pagination returned %v, want %v", seen, keys))
 	}
 	return Pass()
 }
@@ -977,8 +1030,12 @@ func testListObjectsV2Delimiter(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	if len(out.CommonPrefixes) != 2 {
-		return Fail(fmt.Sprintf("expected 2 common prefixes, got %d", len(out.CommonPrefixes)))
+	var prefixes []string
+	for _, p := range out.CommonPrefixes {
+		prefixes = append(prefixes, aws.ToString(p.Prefix))
+	}
+	if strings.Join(prefixes, ",") != "delim/a/,delim/b/" {
+		return Fail(fmt.Sprintf("expected common prefixes [delim/a/ delim/b/], got %v", prefixes))
 	}
 	if len(out.Contents) != 1 || aws.ToString(out.Contents[0].Key) != "delim/top.txt" {
 		return Fail(fmt.Sprintf("expected only delim/top.txt in Contents, got %v", out.Contents))
@@ -1005,8 +1062,12 @@ func testListObjectsV2StartAfter(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	if len(out.Contents) != 2 || aws.ToString(out.Contents[0].Key) != keys[1] {
-		return Fail(fmt.Sprintf("expected %v, got %v", keys[1:], out.Contents))
+	var got []string
+	for _, c := range out.Contents {
+		got = append(got, aws.ToString(c.Key))
+	}
+	if strings.Join(got, ",") != strings.Join(keys[1:], ",") {
+		return Fail(fmt.Sprintf("expected %v, got %v", keys[1:], got))
 	}
 	return Pass()
 }
@@ -1037,8 +1098,9 @@ func testDeleteObjects(ctx context.Context, env *Env) TestResult {
 		return Fail(fmt.Sprintf("expected 3 deleted, got %d", len(out.Deleted)))
 	}
 	for _, k := range keys {
-		if _, err := headObject(ctx, env, k); err == nil {
-			return Fail("object " + k + " still present after DeleteObjects")
+		_, err := headObject(ctx, env, k)
+		if r := expectFailure(err, "HeadObject of "+k+" after DeleteObjects", 404, "NotFound", "NoSuchKey"); r.Status != StatusPass {
+			return r
 		}
 	}
 	return Pass()
@@ -1074,8 +1136,9 @@ func testDeleteObjectsQuiet(ctx context.Context, env *Env) TestResult {
 		return Fail(fmt.Sprintf("quiet delete listed %d deleted keys", len(out.Deleted)))
 	}
 	for _, k := range keys {
-		if _, err := headObject(ctx, env, k); err == nil {
-			return Fail("object " + k + " still present after quiet DeleteObjects")
+		_, err := headObject(ctx, env, k)
+		if r := expectFailure(err, "HeadObject of "+k+" after quiet DeleteObjects", 404, "NotFound", "NoSuchKey"); r.Status != StatusPass {
+			return r
 		}
 	}
 	return Pass()

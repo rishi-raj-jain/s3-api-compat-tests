@@ -3,6 +3,8 @@ package tests
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strings"
@@ -48,6 +50,22 @@ func uploadPart(ctx context.Context, env *Env, key string, uploadId *string, n i
 		return types.CompletedPart{}, err
 	}
 	return types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.ETag}, nil
+}
+
+// twoPartMD5 is the MD5 of the object completeTwoPartUpload writes.
+func twoPartMD5() string {
+	h := md5.New()
+	for _, fill := range []byte{'1', '2'} {
+		chunk := bytes.Repeat([]byte{fill}, 64*1024)
+		for n := partSize; n > 0; n -= len(chunk) {
+			k := len(chunk)
+			if n < k {
+				k = n
+			}
+			_, _ = h.Write(chunk[:k])
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // completeTwoPartUpload writes key as a two-part multipart upload and returns
@@ -335,12 +353,12 @@ func testUploadPartCopy(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail("complete: " + err.Error())
 	}
-	head, err := headObject(ctx, env, dstKey)
+	got, err := bodyMD5(ctx, env, dstKey)
 	if err != nil {
-		return Fail("head: " + err.Error())
+		return Fail("read: " + err.Error())
 	}
-	if aws.ToInt64(head.ContentLength) != int64(partSize) {
-		return Fail(fmt.Sprintf("copied part length %d, want %d", aws.ToInt64(head.ContentLength), partSize))
+	if got != repeatMD5('x', partSize) {
+		return Fail("copied part bytes differ from the source")
 	}
 	return Pass()
 }
