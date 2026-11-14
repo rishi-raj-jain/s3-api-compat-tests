@@ -79,6 +79,8 @@ Object operations are checked immediately: S3 gives read-after-write and read-af
 
 Bucket configuration operations (tagging, CORS, lifecycle, policy, ACL, encryption, ownership controls, accelerate, versioning) are documented by S3 as eventually consistent. Their read-backs retry for up to 15 seconds (`propagation` in `tests/env.go`) before failing.
 
+A GET after a bucket-configuration delete must fail with the S3 error code for a missing configuration (`NoSuchTagSet`, `NoSuchCORSConfiguration`, ...), not merely with a 404. If a bucket-level delete removes the bucket itself, the test fails for that reason and re-creates the bucket so later tests still run.
+
 ## Operations Tested
 
 **93 tests** across 5 categories:

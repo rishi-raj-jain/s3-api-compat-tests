@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -196,7 +197,7 @@ func testCompleteMultipartUpload(ctx context.Context, env *Env) TestResult {
 	}
 	defer out.Body.Close()
 	var b [2]byte
-	if _, err := out.Body.Read(b[:]); err != nil && b[0] == 0 {
+	if _, err := io.ReadFull(out.Body, b[:]); err != nil {
 		return Fail("range read body: " + err.Error())
 	}
 	if b[0] != '1' || b[1] != '2' {

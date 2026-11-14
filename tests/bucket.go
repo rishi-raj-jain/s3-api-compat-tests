@@ -48,6 +48,28 @@ func BucketTests() []TestDef {
 	}
 }
 
+// ensureBucket re-creates the test bucket when a bucket-level operation removed
+// it (GCS treats DELETE ?tagging as DeleteBucket), so one misbehaving operation
+// does not turn every later test into NoSuchBucket. It reports whether the
+// bucket had vanished.
+func ensureBucket(ctx context.Context, env *Env) bool {
+	if _, err := env.Client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(env.Bucket)}); err == nil {
+		return false
+	}
+	_, _ = env.Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(env.Bucket)})
+	return true
+}
+
+// afterConfigDelete checks the GET that follows a bucket-configuration delete:
+// it must fail with the S3 code for a missing configuration, and the bucket
+// itself must still exist.
+func afterConfigDelete(ctx context.Context, env *Env, err error, what, code string) TestResult {
+	if ensureBucket(ctx, env) {
+		return Fail(what + ": the bucket itself was deleted")
+	}
+	return expectFailure(err, what, 0, code)
+}
+
 func testHeadBucket(ctx context.Context, env *Env) TestResult {
 	_, err := env.Client.HeadBucket(ctx, &s3.HeadBucketInput{
 		Bucket: aws.String(env.Bucket),
@@ -191,7 +213,7 @@ func testDeleteBucketTagging(ctx context.Context, env *Env) TestResult {
 			return Fail(err.Error())
 		}
 		_, err = bucketTags(ctx, env)
-		return expectFailure(err, "GetBucketTagging after delete", 404, "NoSuchTagSet")
+		return afterConfigDelete(ctx, env, err, "GetBucketTagging after delete", "NoSuchTagSet")
 	})
 }
 
@@ -255,7 +277,7 @@ func testDeleteBucketCors(ctx context.Context, env *Env) TestResult {
 			return Fail(err.Error())
 		}
 		_, err = env.Client.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(env.Bucket)})
-		return expectFailure(err, "GetBucketCors after delete", 404, "NoSuchCORSConfiguration")
+		return afterConfigDelete(ctx, env, err, "GetBucketCors after delete", "NoSuchCORSConfiguration")
 	})
 }
 
@@ -327,7 +349,7 @@ func testDeleteBucketLifecycle(ctx context.Context, env *Env) TestResult {
 			return Fail(err.Error())
 		}
 		_, err = env.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: aws.String(env.Bucket)})
-		return expectFailure(err, "GetBucketLifecycleConfiguration after delete", 404, "NoSuchLifecycleConfiguration")
+		return afterConfigDelete(ctx, env, err, "GetBucketLifecycleConfiguration after delete", "NoSuchLifecycleConfiguration")
 	})
 }
 
@@ -423,7 +445,7 @@ func testDeleteBucketPolicy(ctx context.Context, env *Env) TestResult {
 			return Fail(err.Error())
 		}
 		_, err = env.Client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(env.Bucket)})
-		return expectFailure(err, "GetBucketPolicy after delete", 404, "NoSuchBucketPolicy")
+		return afterConfigDelete(ctx, env, err, "GetBucketPolicy after delete", "NoSuchBucketPolicy")
 	})
 }
 
@@ -564,7 +586,7 @@ func testDeleteBucketEncryption(ctx context.Context, env *Env) TestResult {
 			return Fail(err.Error())
 		}
 		_, err = env.Client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(env.Bucket)})
-		return expectFailure(err, "GetBucketEncryption after delete", 404, "ServerSideEncryptionConfigurationNotFoundError")
+		return afterConfigDelete(ctx, env, err, "GetBucketEncryption after delete", "ServerSideEncryptionConfigurationNotFoundError")
 	})
 }
 
@@ -613,7 +635,7 @@ func testDeleteBucketOwnershipControls(ctx context.Context, env *Env) TestResult
 			return Fail(err.Error())
 		}
 		_, err = env.Client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{Bucket: aws.String(env.Bucket)})
-		return expectFailure(err, "GetBucketOwnershipControls after delete", 404, "OwnershipControlsNotFoundError")
+		return afterConfigDelete(ctx, env, err, "GetBucketOwnershipControls after delete", "OwnershipControlsNotFoundError")
 	})
 }
 

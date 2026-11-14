@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -26,6 +30,11 @@ type Provider struct {
 	// StripSDKHeaders removes amz-sdk-* and accept-encoding headers before
 	// signing. GCS rejects requests signed with headers it doesn't understand.
 	StripSDKHeaders bool
+
+	// ChecksumsOnlyWhenRequired makes the SDK add a request checksum only for
+	// operations that require one, instead of on every PUT. GCS rejects the
+	// signature of a request that carries the SDK's default CRC32 checksum.
+	ChecksumsOnlyWhenRequired bool
 
 	// VersionedBucketHeaders are sent with the CreateBucket request for the
 	// versioned test bucket, for providers where versioning is a creation-time
@@ -51,6 +60,26 @@ func (stripSDKHeadersMiddleware) HandleFinalize(
 		req.Header.Del("Accept-Encoding")
 		req.Header.Del("Amz-Sdk-Invocation-Id")
 		req.Header.Del("Amz-Sdk-Request")
+		// The SDK's default request checksum for operations that require one;
+		// GCS does not know these headers. GCS wants Content-MD5 on those
+		// operations instead, so compute it from the body before stripping.
+		hadChecksum := false
+		for h := range req.Header {
+			if strings.HasPrefix(strings.ToLower(h), "x-amz-checksum-") {
+				req.Header.Del(h)
+				hadChecksum = true
+			}
+		}
+		req.Header.Del("X-Amz-Sdk-Checksum-Algorithm")
+		if hadChecksum && req.Header.Get("Content-Md5") == "" {
+			if stream := req.GetStream(); stream != nil {
+				if body, err := io.ReadAll(stream); err == nil {
+					sum := md5.Sum(body)
+					req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(sum[:]))
+					_ = req.RewindStream()
+				}
+			}
+		}
 	}
 	return next.HandleFinalize(ctx, in)
 }
@@ -73,6 +102,10 @@ func (p *Provider) NewClient(ctx context.Context) (*s3.Client, error) {
 		o.UsePathStyle = p.PathStyle
 		o.Region = p.Region
 		o.DisableLogOutputChecksumValidationSkipped = true
+		if p.ChecksumsOnlyWhenRequired {
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+		}
 		if p.StripSDKHeaders {
 			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
 				// Try to insert before "Signing" (normal client) or just add
@@ -167,6 +200,8 @@ func LoadProviders(names []string) []Provider {
 			AccessKey:       os.Getenv("GCS_ACCESS_KEY_ID"),
 			SecretKey:       os.Getenv("GCS_SECRET_ACCESS_KEY"),
 			StripSDKHeaders: true,
+
+			ChecksumsOnlyWhenRequired: true,
 		},
 	}
 
