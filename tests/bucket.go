@@ -13,6 +13,7 @@ import (
 func BucketTests() []TestDef {
 	return []TestDef{
 		{"HeadBucket", "bucket", testHeadBucket},
+		{"HeadBucket_NoSuchBucket", "bucket", testHeadBucketNoSuchBucket},
 		{"ListBuckets", "bucket", testListBuckets},
 		{"GetBucketLocation", "bucket", testGetBucketLocation},
 		{"CreateBucket", "bucket", testCreateBucket},
@@ -30,10 +31,12 @@ func BucketTests() []TestDef {
 		{"GetBucketAcl", "bucket", testGetBucketAcl},
 		{"PutBucketPolicy", "bucket", testPutBucketPolicy},
 		{"GetBucketPolicy", "bucket", testGetBucketPolicy},
+		{"DeleteBucketPolicy", "bucket", testDeleteBucketPolicy},
 		{"GetBucketPolicyStatus", "bucket", testGetBucketPolicyStatus},
 		{"PutBucketVersioning", "bucket", testPutBucketVersioning},
-		{"GetBucketVersioning", "bucket", testGetBucketVersioning},
-		{"ListObjectVersions", "bucket", testListObjectVersions},
+		{"PutBucketAccelerateConfiguration", "bucket", testPutBucketAccelerateConfiguration},
+		{"GetBucketAccelerateConfiguration", "bucket", testGetBucketAccelerateConfiguration},
+		{"GetBucketRequestPayment", "bucket", testGetBucketRequestPayment},
 		{"PutBucketEncryption", "bucket", testPutBucketEncryption},
 		{"GetBucketEncryption", "bucket", testGetBucketEncryption},
 		{"DeleteBucketEncryption", "bucket", testDeleteBucketEncryption},
@@ -55,12 +58,19 @@ func testHeadBucket(ctx context.Context, env *Env) TestResult {
 	return Pass()
 }
 
+// HeadBucket of a bucket that does not exist is 404.
+func testHeadBucketNoSuchBucket(ctx context.Context, env *Env) TestResult {
+	_, err := env.Client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(env.Bucket + "-does-not-exist"),
+	})
+	return expectFailure(err, "HeadBucket of a missing bucket", 404, "NotFound", "NoSuchBucket")
+}
+
 func testListBuckets(ctx context.Context, env *Env) TestResult {
 	out, err := env.Client.ListBuckets(ctx, &s3.ListBucketsInput{})
 	if err != nil {
 		return Fail(err.Error())
 	}
-	// Verify test bucket appears.
 	for _, b := range out.Buckets {
 		if aws.ToString(b.Name) == env.Bucket {
 			return Pass()
@@ -69,6 +79,8 @@ func testListBuckets(ctx context.Context, env *Env) TestResult {
 	return Fail("test bucket not found in ListBuckets response")
 }
 
+// GetBucketLocation answers; the constraint value is provider-specific and may
+// be empty for the default region, as on AWS us-east-1.
 func testGetBucketLocation(ctx context.Context, env *Env) TestResult {
 	_, err := env.Client.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
 		Bucket: aws.String(env.Bucket),
@@ -79,6 +91,7 @@ func testGetBucketLocation(ctx context.Context, env *Env) TestResult {
 	return Pass()
 }
 
+// CreateBucket makes a bucket that HeadBucket then finds.
 func testCreateBucket(ctx context.Context, env *Env) TestResult {
 	name := env.Bucket + "-create-test"
 	_, err := env.Client.CreateBucket(ctx, &s3.CreateBucketInput{
@@ -87,13 +100,16 @@ func testCreateBucket(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	// Clean up immediately.
-	_, _ = env.Client.DeleteBucket(ctx, &s3.DeleteBucketInput{
-		Bucket: aws.String(name),
-	})
+	defer func() {
+		_, _ = env.Client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(name)})
+	}()
+	if _, err := env.Client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)}); err != nil {
+		return Fail("HeadBucket after create: " + err.Error())
+	}
 	return Pass()
 }
 
+// DeleteBucket removes the bucket; HeadBucket is then 404.
 func testDeleteBucket(ctx context.Context, env *Env) TestResult {
 	name := env.Bucket + "-delete-test"
 	_, err := env.Client.CreateBucket(ctx, &s3.CreateBucketInput{
@@ -109,153 +125,237 @@ func testDeleteBucket(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	return Pass()
+	_, err = env.Client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)})
+	return expectFailure(err, "HeadBucket after DeleteBucket", 404, "NotFound", "NoSuchBucket")
 }
 
 // --- Tagging ---
 
-func testPutBucketTagging(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.PutBucketTagging(ctx, &s3.PutBucketTaggingInput{
-		Bucket: aws.String(env.Bucket),
-		Tagging: &types.Tagging{
-			TagSet: []types.Tag{
-				{Key: aws.String("env"), Value: aws.String("test")},
-				{Key: aws.String("suite"), Value: aws.String("s3-compat")},
-			},
-		},
-	})
+func bucketTags(ctx context.Context, env *Env) (map[string]string, error) {
+	out, err := env.Client.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{Bucket: aws.String(env.Bucket)})
 	if err != nil {
-		return Fail(err.Error())
+		return nil, err
 	}
-	return Pass()
+	tags := map[string]string{}
+	for _, t := range out.TagSet {
+		tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+	}
+	return tags, nil
+}
+
+func testPutBucketTagging(ctx context.Context, env *Env) TestResult {
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.PutBucketTagging(ctx, &s3.PutBucketTaggingInput{
+			Bucket: aws.String(env.Bucket),
+			Tagging: &types.Tagging{
+				TagSet: []types.Tag{
+					{Key: aws.String("env"), Value: aws.String("test")},
+					{Key: aws.String("suite"), Value: aws.String("s3-compat")},
+				},
+			},
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		tags, err := bucketTags(ctx, env)
+		if err != nil {
+			return Fail("get tags: " + err.Error())
+		}
+		if tags["env"] != "test" || tags["suite"] != "s3-compat" || len(tags) != 2 {
+			return Fail(fmt.Sprintf("tags not stored: %v", tags))
+		}
+		return Pass()
+	})
 }
 
 func testGetBucketTagging(ctx context.Context, env *Env) TestResult {
-	out, err := env.Client.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		tags, err := bucketTags(ctx, env)
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if tags["env"] != "test" {
+			return Fail(fmt.Sprintf("expected env=test, got %v", tags))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	if len(out.TagSet) == 0 {
-		return Fail("no tags returned")
-	}
-	return Pass()
 }
 
+// After DeleteBucketTagging, GetBucketTagging is 404 NoSuchTagSet.
 func testDeleteBucketTagging(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.DeleteBucketTagging(ctx, &s3.DeleteBucketTaggingInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.DeleteBucketTagging(ctx, &s3.DeleteBucketTaggingInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		_, err = bucketTags(ctx, env)
+		return expectFailure(err, "GetBucketTagging after delete", 404, "NoSuchTagSet")
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 // --- CORS ---
 
 func testPutBucketCors(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.PutBucketCors(ctx, &s3.PutBucketCorsInput{
-		Bucket: aws.String(env.Bucket),
-		CORSConfiguration: &types.CORSConfiguration{
-			CORSRules: []types.CORSRule{
-				{
-					AllowedOrigins: []string{"https://example.com"},
-					AllowedMethods: []string{"GET", "PUT"},
-					AllowedHeaders: []string{"*"},
-					MaxAgeSeconds:  aws.Int32(3600),
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+			Bucket: aws.String(env.Bucket),
+			CORSConfiguration: &types.CORSConfiguration{
+				CORSRules: []types.CORSRule{
+					{
+						AllowedOrigins: []string{"https://example.com"},
+						AllowedMethods: []string{"GET", "PUT"},
+						AllowedHeaders: []string{"*"},
+						MaxAgeSeconds:  aws.Int32(3600),
+					},
 				},
 			},
-		},
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		out, err := env.Client.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(env.Bucket)})
+		if err != nil {
+			return Fail("get cors: " + err.Error())
+		}
+		if len(out.CORSRules) != 1 || len(out.CORSRules[0].AllowedOrigins) != 1 || out.CORSRules[0].AllowedOrigins[0] != "https://example.com" {
+			return Fail(fmt.Sprintf("CORS rule not stored as sent: %+v", out.CORSRules))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 func testGetBucketCors(ctx context.Context, env *Env) TestResult {
-	out, err := env.Client.GetBucketCors(ctx, &s3.GetBucketCorsInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		out, err := env.Client.GetBucketCors(ctx, &s3.GetBucketCorsInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if len(out.CORSRules) == 0 {
+			return Fail("no CORS rules returned")
+		}
+		methods := strings.Join(out.CORSRules[0].AllowedMethods, ",")
+		if !strings.Contains(methods, "GET") || !strings.Contains(methods, "PUT") {
+			return Fail(fmt.Sprintf("allowed methods mismatch: %s", methods))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	if len(out.CORSRules) == 0 {
-		return Fail("no CORS rules returned")
-	}
-	return Pass()
 }
 
+// After DeleteBucketCors, GetBucketCors is 404 NoSuchCORSConfiguration.
 func testDeleteBucketCors(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		_, err = env.Client.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(env.Bucket)})
+		return expectFailure(err, "GetBucketCors after delete", 404, "NoSuchCORSConfiguration")
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 // --- Lifecycle ---
 
 func testPutBucketLifecycle(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
-		Bucket: aws.String(env.Bucket),
-		LifecycleConfiguration: &types.BucketLifecycleConfiguration{
-			Rules: []types.LifecycleRule{
-				{
-					ID:     aws.String("expire-test"),
-					Status: types.ExpirationStatusEnabled,
-					Filter: &types.LifecycleRuleFilter{Prefix: aws.String("expire/")},
-					Expiration: &types.LifecycleExpiration{
-						Days: aws.Int32(30),
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+			Bucket: aws.String(env.Bucket),
+			LifecycleConfiguration: &types.BucketLifecycleConfiguration{
+				Rules: []types.LifecycleRule{
+					{
+						ID:     aws.String("expire-test"),
+						Status: types.ExpirationStatusEnabled,
+						Filter: &types.LifecycleRuleFilter{Prefix: aws.String("expire/")},
+						Expiration: &types.LifecycleExpiration{
+							Days: aws.Int32(30),
+						},
 					},
 				},
 			},
-		},
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		out, err := env.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: aws.String(env.Bucket)})
+		if err != nil {
+			return Fail("get lifecycle: " + err.Error())
+		}
+		if len(out.Rules) != 1 {
+			return Fail(fmt.Sprintf("expected 1 rule, got %d", len(out.Rules)))
+		}
+		r := out.Rules[0]
+		if aws.ToString(r.ID) != "expire-test" || r.Expiration == nil || aws.ToInt32(r.Expiration.Days) != 30 {
+			return Fail(fmt.Sprintf("rule not stored as sent: %+v", r))
+		}
+		if r.Filter == nil || aws.ToString(r.Filter.Prefix) != "expire/" {
+			return Fail(fmt.Sprintf("rule prefix not stored: %+v", r.Filter))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 func testGetBucketLifecycle(ctx context.Context, env *Env) TestResult {
-	out, err := env.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		out, err := env.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if len(out.Rules) == 0 {
+			return Fail("no lifecycle rules returned")
+		}
+		if out.Rules[0].Status != types.ExpirationStatusEnabled {
+			return Fail(fmt.Sprintf("rule status %q, want Enabled", out.Rules[0].Status))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	if len(out.Rules) == 0 {
-		return Fail("no lifecycle rules returned")
-	}
-	return Pass()
 }
 
+// After DeleteBucketLifecycle, the GET is 404 NoSuchLifecycleConfiguration.
 func testDeleteBucketLifecycle(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		_, err = env.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: aws.String(env.Bucket)})
+		return expectFailure(err, "GetBucketLifecycleConfiguration after delete", 404, "NoSuchLifecycleConfiguration")
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 // --- ACL ---
 
 func testPutBucketAcl(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
-		Bucket: aws.String(env.Bucket),
-		ACL:    types.BucketCannedACLPrivate,
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: aws.String(env.Bucket),
+			ACL:    types.BucketCannedACLPrivate,
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		out, err := env.Client.GetBucketAcl(ctx, &s3.GetBucketAclInput{Bucket: aws.String(env.Bucket)})
+		if err != nil {
+			return Fail("get acl: " + err.Error())
+		}
+		if len(out.Grants) == 0 {
+			return Fail("no grants after PutBucketAcl private")
+		}
+		for _, g := range out.Grants {
+			if g.Grantee != nil && g.Grantee.Type == types.TypeGroup && strings.Contains(aws.ToString(g.Grantee.URI), "AllUsers") {
+				return Fail("private ACL still grants AllUsers")
+			}
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 func testGetBucketAcl(ctx context.Context, env *Env) TestResult {
@@ -267,6 +367,9 @@ func testGetBucketAcl(ctx context.Context, env *Env) TestResult {
 	}
 	if out.Owner == nil {
 		return Fail("no owner in ACL response")
+	}
+	if len(out.Grants) == 0 {
+		return Fail("no grants in ACL response")
 	}
 	return Pass()
 }
@@ -296,80 +399,117 @@ func testPutBucketPolicy(ctx context.Context, env *Env) TestResult {
 }
 
 func testGetBucketPolicy(ctx context.Context, env *Env) TestResult {
-	out, err := env.Client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		out, err := env.Client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if out.Policy == nil || !strings.Contains(*out.Policy, "CompatTest") {
+			return Fail("policy not returned correctly")
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	if out.Policy == nil || !strings.Contains(*out.Policy, "CompatTest") {
-		return Fail("policy not returned correctly")
-	}
-	return Pass()
 }
 
+// After DeleteBucketPolicy, GetBucketPolicy is 404 NoSuchBucketPolicy.
+func testDeleteBucketPolicy(ctx context.Context, env *Env) TestResult {
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		_, err = env.Client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(env.Bucket)})
+		return expectFailure(err, "GetBucketPolicy after delete", 404, "NoSuchBucketPolicy")
+	})
+}
+
+// A fresh private bucket is not public.
 func testGetBucketPolicyStatus(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.GetBucketPolicyStatus(ctx, &s3.GetBucketPolicyStatusInput{
+	out, err := env.Client.GetBucketPolicyStatus(ctx, &s3.GetBucketPolicyStatusInput{
 		Bucket: aws.String(env.Bucket),
 	})
 	if err != nil {
 		return Fail(err.Error())
 	}
+	if out.PolicyStatus == nil {
+		return Fail("no PolicyStatus in response")
+	}
+	if aws.ToBool(out.PolicyStatus.IsPublic) {
+		return Fail("fresh bucket reported as public")
+	}
 	return Pass()
 }
 
-// --- Versioning ---
+// --- Versioning on an existing bucket ---
 
+// Turning versioning on for a bucket created without it. Providers where
+// versioning is a creation-time property fail here; see the versioning
+// category for the operations on a bucket that has it.
 func testPutBucketVersioning(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-		Bucket: aws.String(env.Bucket),
-		VersioningConfiguration: &types.VersioningConfiguration{
-			Status: types.BucketVersioningStatusEnabled,
-		},
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+			Bucket: aws.String(env.Bucket),
+			VersioningConfiguration: &types.VersioningConfiguration{
+				Status: types.BucketVersioningStatusEnabled,
+			},
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		out, err := env.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(env.Bucket)})
+		if err != nil {
+			return Fail("get versioning: " + err.Error())
+		}
+		if out.Status != types.BucketVersioningStatusEnabled {
+			return Fail(fmt.Sprintf("PutBucketVersioning succeeded but status is %q", out.Status))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
-func testGetBucketVersioning(ctx context.Context, env *Env) TestResult {
-	// Enable versioning, then verify Get returns the configured status.
-	// A provider that silently no-ops PutBucketVersioning will return an
-	// empty status here and fail this assertion.
-	_, err := env.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-		Bucket: aws.String(env.Bucket),
-		VersioningConfiguration: &types.VersioningConfiguration{
-			Status: types.BucketVersioningStatusEnabled,
-		},
-	})
-	if err != nil {
-		return Fail("PutBucketVersioning: " + err.Error())
-	}
+// --- Accelerate and request payment ---
 
-	out, err := env.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
-		Bucket: aws.String(env.Bucket),
+func testPutBucketAccelerateConfiguration(ctx context.Context, env *Env) TestResult {
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.PutBucketAccelerateConfiguration(ctx, &s3.PutBucketAccelerateConfigurationInput{
+			Bucket:                  aws.String(env.Bucket),
+			AccelerateConfiguration: &types.AccelerateConfiguration{Status: types.BucketAccelerateStatusSuspended},
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	if out.Status != types.BucketVersioningStatusEnabled {
-		return Fail(fmt.Sprintf("expected status Enabled, got %q", out.Status))
-	}
-	return Pass()
 }
 
-func testListObjectVersions(ctx context.Context, env *Env) TestResult {
-	// Tigris exposes ListObjectVersions on snapshot-enabled buckets;
-	// other providers expose it through standard bucket versioning. The
-	// compat suite uses a fresh non-snapshot bucket, so we only assert
-	// the call is wired up and returns without error — an empty list is
-	// the expected S3 response for an unversioned bucket.
-	_, err := env.Client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+func testGetBucketAccelerateConfiguration(ctx context.Context, env *Env) TestResult {
+	return eventually(ctx, propagation, func() TestResult {
+		out, err := env.Client.GetBucketAccelerateConfiguration(ctx, &s3.GetBucketAccelerateConfigurationInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if out.Status != types.BucketAccelerateStatusSuspended {
+			return Fail(fmt.Sprintf("expected Suspended after the Put, got %q", out.Status))
+		}
+		return Pass()
+	})
+}
+
+func testGetBucketRequestPayment(ctx context.Context, env *Env) TestResult {
+	out, err := env.Client.GetBucketRequestPayment(ctx, &s3.GetBucketRequestPaymentInput{
 		Bucket: aws.String(env.Bucket),
 	})
 	if err != nil {
 		return Fail(err.Error())
+	}
+	if out.Payer != types.PayerBucketOwner {
+		return Fail(fmt.Sprintf("expected Payer BucketOwner, got %q", out.Payer))
 	}
 	return Pass()
 }
@@ -396,26 +536,36 @@ func testPutBucketEncryption(ctx context.Context, env *Env) TestResult {
 }
 
 func testGetBucketEncryption(ctx context.Context, env *Env) TestResult {
-	out, err := env.Client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		out, err := env.Client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if out.ServerSideEncryptionConfiguration == nil || len(out.ServerSideEncryptionConfiguration.Rules) == 0 {
+			return Fail("no encryption rules returned")
+		}
+		d := out.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault
+		if d == nil || d.SSEAlgorithm != types.ServerSideEncryptionAes256 {
+			return Fail(fmt.Sprintf("expected AES256 default, got %+v", d))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	if len(out.ServerSideEncryptionConfiguration.Rules) == 0 {
-		return Fail("no encryption rules returned")
-	}
-	return Pass()
 }
 
+// After DeleteBucketEncryption, the GET is 404 ServerSideEncryptionConfigurationNotFoundError.
 func testDeleteBucketEncryption(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		_, err = env.Client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(env.Bucket)})
+		return expectFailure(err, "GetBucketEncryption after delete", 404, "ServerSideEncryptionConfigurationNotFoundError")
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 // --- Ownership Controls ---
@@ -436,26 +586,35 @@ func testPutBucketOwnershipControls(ctx context.Context, env *Env) TestResult {
 }
 
 func testGetBucketOwnershipControls(ctx context.Context, env *Env) TestResult {
-	out, err := env.Client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		out, err := env.Client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if out.OwnershipControls == nil || len(out.OwnershipControls.Rules) == 0 {
+			return Fail("no ownership rules returned")
+		}
+		if out.OwnershipControls.Rules[0].ObjectOwnership != types.ObjectOwnershipBucketOwnerEnforced {
+			return Fail(fmt.Sprintf("expected BucketOwnerEnforced, got %q", out.OwnershipControls.Rules[0].ObjectOwnership))
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	if len(out.OwnershipControls.Rules) == 0 {
-		return Fail("no ownership rules returned")
-	}
-	return Pass()
 }
 
+// After DeleteBucketOwnershipControls, the GET is 404 OwnershipControlsNotFoundError.
 func testDeleteBucketOwnershipControls(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.DeleteBucketOwnershipControls(ctx, &s3.DeleteBucketOwnershipControlsInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		_, err := env.Client.DeleteBucketOwnershipControls(ctx, &s3.DeleteBucketOwnershipControlsInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		_, err = env.Client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{Bucket: aws.String(env.Bucket)})
+		return expectFailure(err, "GetBucketOwnershipControls after delete", 404, "OwnershipControlsNotFoundError")
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }
 
 // --- Notifications ---
@@ -472,12 +631,19 @@ func testPutBucketNotificationConfiguration(ctx context.Context, env *Env) TestR
 	return Pass()
 }
 
+// GetBucketNotificationConfiguration on a bucket with no notifications returns
+// an empty configuration.
 func testGetBucketNotificationConfiguration(ctx context.Context, env *Env) TestResult {
-	_, err := env.Client.GetBucketNotificationConfiguration(ctx, &s3.GetBucketNotificationConfigurationInput{
-		Bucket: aws.String(env.Bucket),
+	return eventually(ctx, propagation, func() TestResult {
+		out, err := env.Client.GetBucketNotificationConfiguration(ctx, &s3.GetBucketNotificationConfigurationInput{
+			Bucket: aws.String(env.Bucket),
+		})
+		if err != nil {
+			return Fail(err.Error())
+		}
+		if len(out.TopicConfigurations)+len(out.QueueConfigurations)+len(out.LambdaFunctionConfigurations) != 0 {
+			return Fail("expected an empty notification configuration")
+		}
+		return Pass()
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-	return Pass()
 }

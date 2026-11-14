@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
@@ -25,6 +26,12 @@ type Provider struct {
 	// StripSDKHeaders removes amz-sdk-* and accept-encoding headers before
 	// signing. GCS rejects requests signed with headers it doesn't understand.
 	StripSDKHeaders bool
+
+	// VersionedBucketHeaders are sent with the CreateBucket request for the
+	// versioned test bucket, for providers where versioning is a creation-time
+	// property. When empty, the runner enables versioning with
+	// PutBucketVersioning after creating the bucket.
+	VersionedBucketHeaders map[string]string
 }
 
 // stripSDKHeadersMiddleware removes SDK-specific headers before signing.
@@ -88,6 +95,40 @@ func (p *Provider) NewPresignClient(ctx context.Context) (*s3.PresignClient, err
 	return s3.NewPresignClient(client), nil
 }
 
+// CreateVersionedBucket creates a bucket with object versioning enabled, the
+// way this provider supports it, and returns an error that says why when it
+// cannot.
+func (p *Provider) CreateVersionedBucket(ctx context.Context, client *s3.Client, name string) error {
+	var opts []func(*s3.Options)
+	for k, v := range p.VersionedBucketHeaders {
+		k, v := k, v
+		opts = append(opts, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, smithyhttp.AddHeaderValue(k, v))
+		})
+	}
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(name)}, opts...); err != nil {
+		return fmt.Errorf("create bucket: %w", err)
+	}
+	if len(p.VersionedBucketHeaders) == 0 {
+		if _, err := client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+			Bucket: aws.String(name),
+			VersioningConfiguration: &types.VersioningConfiguration{
+				Status: types.BucketVersioningStatusEnabled,
+			},
+		}); err != nil {
+			return fmt.Errorf("enable versioning: %w", err)
+		}
+	}
+	out, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(name)})
+	if err != nil {
+		return fmt.Errorf("get versioning: %w", err)
+	}
+	if out.Status != types.BucketVersioningStatusEnabled {
+		return fmt.Errorf("versioning status is %q after enabling", out.Status)
+	}
+	return nil
+}
+
 // LoadProviders reads env vars and returns providers that have credentials configured.
 // If names is non-empty, only those named providers are returned.
 func LoadProviders(names []string) []Provider {
@@ -99,6 +140,8 @@ func LoadProviders(names []string) []Provider {
 			PathStyle: false,
 			AccessKey: firstEnv("TIGRIS_ACCESS_KEY_ID", "TIGRIS_STORAGE_ACCESS_KEY_ID"),
 			SecretKey: firstEnv("TIGRIS_SECRET_ACCESS_KEY", "TIGRIS_STORAGE_SECRET_ACCESS_KEY"),
+			// Versioning is a creation-time property on Tigris.
+			VersionedBucketHeaders: map[string]string{"X-Tigris-Enable-Snapshot": "true"},
 		},
 		{
 			Name:      "aws",
@@ -146,14 +189,6 @@ func LoadProviders(names []string) []Provider {
 	return out
 }
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// firstEnv returns the value of the first non-empty env var.
 func firstEnv(keys ...string) string {
 	for _, k := range keys {
 		if v := os.Getenv(k); v != "" {
@@ -161,4 +196,11 @@ func firstEnv(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

@@ -10,6 +10,7 @@ func All() []TestDef {
 	var all []TestDef
 	all = append(all, ObjectTests()...)
 	all = append(all, BucketTests()...)
+	all = append(all, VersioningTests()...)
 	all = append(all, MultipartTests()...)
 	all = append(all, PresignedTests()...)
 	return all
