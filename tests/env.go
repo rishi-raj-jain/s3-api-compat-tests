@@ -44,6 +44,10 @@ type TestResult struct {
 	DurationMs int64  `json:"duration_ms"`
 	Error      string `json:"error,omitempty"`
 	Notes      string `json:"notes,omitempty"`
+
+	// final marks a verdict that a retry cannot change, such as "the bucket
+	// itself was deleted"; eventually returns it at once.
+	final bool
 }
 
 const (
@@ -55,6 +59,7 @@ const (
 
 func Pass() TestResult                    { return TestResult{Status: StatusPass} }
 func Fail(err string) TestResult          { return TestResult{Status: StatusFail, Error: err} }
+func FailFinal(err string) TestResult     { return TestResult{Status: StatusFail, Error: err, final: true} }
 func Skip(reason string) TestResult       { return TestResult{Status: StatusSkip, Notes: reason} }
 func Error(err string) TestResult         { return TestResult{Status: StatusError, Error: err} }
 func PassWithNote(note string) TestResult { return TestResult{Status: StatusPass, Notes: note} }
@@ -67,7 +72,7 @@ func eventually(ctx context.Context, d time.Duration, fn func() TestResult) Test
 	deadline := time.Now().Add(d)
 	for {
 		r := fn()
-		if r.Status == StatusPass || time.Now().After(deadline) {
+		if r.Status == StatusPass || r.final || time.Now().After(deadline) {
 			return r
 		}
 		select {

@@ -74,10 +74,11 @@ func ensureBucket(ctx context.Context, env *Env) (bool, error) {
 func afterConfigDelete(ctx context.Context, env *Env, err error, what, code string) TestResult {
 	vanished, herr := ensureBucket(ctx, env)
 	if herr != nil {
-		return Fail(fmt.Sprintf("%s: HeadBucket: %v", what, herr))
+		return FailFinal(fmt.Sprintf("%s: HeadBucket: %v", what, herr))
 	}
 	if vanished {
-		return Fail(what + ": the bucket itself was deleted")
+		// A retry would read the fresh bucket and pass; this verdict is final.
+		return FailFinal(what + ": the bucket itself was deleted")
 	}
 	return expectFailure(err, what, 0, code)
 }
@@ -418,6 +419,9 @@ func testGetBucketAcl(ctx context.Context, env *Env) TestResult {
 
 // --- Policy ---
 
+// putPolicy installs a statement that denies nothing the suite or the cleanup
+// needs (GetObjectTorrent on one key), so a policy left behind cannot block a
+// later test or the bucket delete.
 func putPolicy(ctx context.Context, env *Env) error {
 	policy := fmt.Sprintf(`{
 		"Version": "2012-10-17",
@@ -425,8 +429,8 @@ func putPolicy(ctx context.Context, env *Env) error {
 			"Sid": "CompatTest",
 			"Effect": "Deny",
 			"Principal": "*",
-			"Action": "s3:DeleteBucket",
-			"Resource": "arn:aws:s3:::%s"
+			"Action": "s3:GetObjectTorrent",
+			"Resource": "arn:aws:s3:::%s/compat-test-policy-marker"
 		}]
 	}`, env.Bucket)
 	_, err := env.Client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
@@ -434,6 +438,10 @@ func putPolicy(ctx context.Context, env *Env) error {
 		Policy: aws.String(policy),
 	})
 	return err
+}
+
+func removePolicy(ctx context.Context, env *Env) {
+	_, _ = env.Client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{Bucket: aws.String(env.Bucket)})
 }
 
 func checkPolicy(ctx context.Context, env *Env) TestResult {
@@ -453,6 +461,7 @@ func testPutBucketPolicy(ctx context.Context, env *Env) TestResult {
 	if err := putPolicy(ctx, env); err != nil {
 		return Fail(err.Error())
 	}
+	defer removePolicy(ctx, env)
 	return checkPolicy(ctx, env)
 }
 
@@ -460,6 +469,7 @@ func testGetBucketPolicy(ctx context.Context, env *Env) TestResult {
 	if err := putPolicy(ctx, env); err != nil {
 		return Error("setup: " + err.Error())
 	}
+	defer removePolicy(ctx, env)
 	return checkPolicy(ctx, env)
 }
 
