@@ -3,7 +3,10 @@ package tests
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -19,12 +22,85 @@ func MultipartTests() []TestDef {
 		{"UploadPart", "multipart", testUploadPart},
 		{"ListParts", "multipart", testListParts},
 		{"CompleteMultipartUpload", "multipart", testCompleteMultipartUpload},
+		{"CompleteMultipartUpload_InvalidPartOrder", "multipart", testCompleteMultipartUploadInvalidPartOrder},
 		{"AbortMultipartUpload", "multipart", testAbortMultipartUpload},
 		{"ListMultipartUploads", "multipart", testListMultipartUploads},
 		{"UploadPartCopy", "multipart", testUploadPartCopy},
 	}
 }
 
+func abortUpload(ctx context.Context, env *Env, key string, uploadId *string) {
+	_, _ = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(env.Bucket),
+		Key:      aws.String(key),
+		UploadId: uploadId,
+	})
+}
+
+func uploadPart(ctx context.Context, env *Env, key string, uploadId *string, n int32, fill byte) (types.CompletedPart, error) {
+	part := bytes.Repeat([]byte{fill}, partSize)
+	out, err := env.Client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(env.Bucket),
+		Key:        aws.String(key),
+		UploadId:   uploadId,
+		PartNumber: aws.Int32(n),
+		Body:       bytes.NewReader(part),
+	})
+	if err != nil {
+		return types.CompletedPart{}, err
+	}
+	return types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.ETag}, nil
+}
+
+// twoPartMD5 is the MD5 of the object completeTwoPartUpload writes.
+func twoPartMD5() string {
+	h := md5.New()
+	for _, fill := range []byte{'1', '2'} {
+		chunk := bytes.Repeat([]byte{fill}, 64*1024)
+		for n := partSize; n > 0; n -= len(chunk) {
+			k := len(chunk)
+			if n < k {
+				k = n
+			}
+			_, _ = h.Write(chunk[:k])
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// completeTwoPartUpload writes key as a two-part multipart upload and returns
+// the object's (composite) ETag.
+func completeTwoPartUpload(ctx context.Context, env *Env, key string) (string, error) {
+	create, err := env.Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(env.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return "", fmt.Errorf("create: %w", err)
+	}
+	var parts []types.CompletedPart
+	for i, fill := range []byte{'1', '2'} {
+		p, err := uploadPart(ctx, env, key, create.UploadId, int32(i+1), fill)
+		if err != nil {
+			abortUpload(ctx, env, key, create.UploadId)
+			return "", fmt.Errorf("upload part %d: %w", i+1, err)
+		}
+		parts = append(parts, p)
+	}
+	out, err := env.Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(env.Bucket),
+		Key:             aws.String(key),
+		UploadId:        create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	if err != nil {
+		abortUpload(ctx, env, key, create.UploadId)
+		return "", fmt.Errorf("complete: %w", err)
+	}
+	return aws.ToString(out.ETag), nil
+}
+
+// CreateMultipartUpload returns an upload id that ListMultipartUploads shows.
 func testCreateMultipartUpload(ctx context.Context, env *Env) TestResult {
 	key := "mpu-create"
 	out, err := env.Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
@@ -34,15 +110,25 @@ func testCreateMultipartUpload(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	// Abort to clean up.
-	_, _ = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-		Bucket:   aws.String(env.Bucket),
-		Key:      aws.String(key),
-		UploadId: out.UploadId,
+	defer abortUpload(ctx, env, key, out.UploadId)
+	if aws.ToString(out.UploadId) == "" {
+		return Fail("empty UploadId")
+	}
+	list, err := env.Client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(env.Bucket), Prefix: aws.String(key),
 	})
-	return Pass()
+	if err != nil {
+		return Fail("list uploads: " + err.Error())
+	}
+	for _, u := range list.Uploads {
+		if aws.ToString(u.UploadId) == aws.ToString(out.UploadId) {
+			return Pass()
+		}
+	}
+	return Fail("new upload not listed by ListMultipartUploads")
 }
 
+// UploadPart returns an ETag for the part.
 func testUploadPart(ctx context.Context, env *Env) TestResult {
 	key := "mpu-upload-part"
 	create, err := env.Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
@@ -52,28 +138,19 @@ func testUploadPart(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Error("create: " + err.Error())
 	}
-	defer func() {
-		_, _ = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(env.Bucket),
-			Key:      aws.String(key),
-			UploadId: create.UploadId,
-		})
-	}()
+	defer abortUpload(ctx, env, key, create.UploadId)
 
-	part := bytes.Repeat([]byte("a"), partSize)
-	_, err = env.Client.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:     aws.String(env.Bucket),
-		Key:        aws.String(key),
-		UploadId:   create.UploadId,
-		PartNumber: aws.Int32(1),
-		Body:       bytes.NewReader(part),
-	})
+	p, err := uploadPart(ctx, env, key, create.UploadId, 1, 'a')
 	if err != nil {
 		return Fail(err.Error())
+	}
+	if aws.ToString(p.ETag) == "" {
+		return Fail("UploadPart returned no ETag")
 	}
 	return Pass()
 }
 
+// ListParts lists the uploaded part with its number, size and ETag.
 func testListParts(ctx context.Context, env *Env) TestResult {
 	key := "mpu-list-parts"
 	create, err := env.Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
@@ -83,22 +160,9 @@ func testListParts(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Error("create: " + err.Error())
 	}
-	defer func() {
-		_, _ = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(env.Bucket),
-			Key:      aws.String(key),
-			UploadId: create.UploadId,
-		})
-	}()
+	defer abortUpload(ctx, env, key, create.UploadId)
 
-	part := bytes.Repeat([]byte("b"), partSize)
-	_, err = env.Client.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:     aws.String(env.Bucket),
-		Key:        aws.String(key),
-		UploadId:   create.UploadId,
-		PartNumber: aws.Int32(1),
-		Body:       bytes.NewReader(part),
-	})
+	p, err := uploadPart(ctx, env, key, create.UploadId, 1, 'b')
 	if err != nil {
 		return Error("upload: " + err.Error())
 	}
@@ -111,14 +175,58 @@ func testListParts(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	if len(out.Parts) == 0 {
-		return Fail("no parts listed")
+	if len(out.Parts) != 1 {
+		return Fail(fmt.Sprintf("expected 1 part, got %d", len(out.Parts)))
+	}
+	got := out.Parts[0]
+	if aws.ToInt32(got.PartNumber) != 1 || aws.ToInt64(got.Size) != int64(partSize) || aws.ToString(got.ETag) != aws.ToString(p.ETag) {
+		return Fail(fmt.Sprintf("part mismatch: number=%d size=%d etag=%s", aws.ToInt32(got.PartNumber), aws.ToInt64(got.Size), aws.ToString(got.ETag)))
 	}
 	return Pass()
 }
 
+// CompleteMultipartUpload joins the parts: the object has the full length, a
+// composite ETag, and the bytes of both parts in order.
 func testCompleteMultipartUpload(ctx context.Context, env *Env) TestResult {
 	key := "mpu-complete"
+	etag, err := completeTwoPartUpload(ctx, env, key)
+	if err != nil {
+		return Fail(err.Error())
+	}
+	defer deleteObject(ctx, env, key)
+
+	if !strings.HasSuffix(strings.Trim(etag, `"`), "-2") {
+		return Fail(fmt.Sprintf("expected a composite ETag ending in -2, got %s", etag))
+	}
+	head, err := headObject(ctx, env, key)
+	if err != nil {
+		return Fail("head: " + err.Error())
+	}
+	if aws.ToInt64(head.ContentLength) != int64(2*partSize) {
+		return Fail(fmt.Sprintf("length mismatch: got %d, want %d", aws.ToInt64(head.ContentLength), 2*partSize))
+	}
+	// The first byte of part 2 sits at offset partSize.
+	out, err := env.Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(env.Bucket), Key: aws.String(key),
+		Range: aws.String(fmt.Sprintf("bytes=%d-%d", partSize-1, partSize)),
+	})
+	if err != nil {
+		return Fail("range read: " + err.Error())
+	}
+	defer out.Body.Close()
+	var b [2]byte
+	if _, err := io.ReadFull(out.Body, b[:]); err != nil {
+		return Fail("range read body: " + err.Error())
+	}
+	if b[0] != '1' || b[1] != '2' {
+		return Fail(fmt.Sprintf("part boundary bytes %q, want \"12\"", string(b[:])))
+	}
+	return Pass()
+}
+
+// Parts listed out of order are refused with InvalidPartOrder.
+func testCompleteMultipartUploadInvalidPartOrder(ctx context.Context, env *Env) TestResult {
+	key := "mpu-part-order"
 	create, err := env.Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(env.Bucket),
 		Key:    aws.String(key),
@@ -126,52 +234,27 @@ func testCompleteMultipartUpload(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Error("create: " + err.Error())
 	}
+	defer abortUpload(ctx, env, key, create.UploadId)
+	defer deleteObject(ctx, env, key)
 
-	part := bytes.Repeat([]byte("c"), partSize)
-	up, err := env.Client.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:     aws.String(env.Bucket),
-		Key:        aws.String(key),
-		UploadId:   create.UploadId,
-		PartNumber: aws.Int32(1),
-		Body:       bytes.NewReader(part),
-	})
+	p1, err := uploadPart(ctx, env, key, create.UploadId, 1, '1')
 	if err != nil {
-		_, _ = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-			Bucket: aws.String(env.Bucket), Key: aws.String(key), UploadId: create.UploadId,
-		})
-		return Error("upload: " + err.Error())
+		return Error("upload part 1: " + err.Error())
 	}
-
+	p2, err := uploadPart(ctx, env, key, create.UploadId, 2, '2')
+	if err != nil {
+		return Error("upload part 2: " + err.Error())
+	}
 	_, err = env.Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   aws.String(env.Bucket),
-		Key:      aws.String(key),
-		UploadId: create.UploadId,
-		MultipartUpload: &types.CompletedMultipartUpload{
-			Parts: []types.CompletedPart{
-				{PartNumber: aws.Int32(1), ETag: up.ETag},
-			},
-		},
+		Bucket:          aws.String(env.Bucket),
+		Key:             aws.String(key),
+		UploadId:        create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{p2, p1}},
 	})
-	if err != nil {
-		return Fail(err.Error())
-	}
-
-	// Verify object exists.
-	_, err = env.Client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(env.Bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return Fail("object not found after complete: " + err.Error())
-	}
-
-	_, _ = env.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(env.Bucket),
-		Key:    aws.String(key),
-	})
-	return Pass()
+	return expectFailure(err, "complete with parts out of order", 0, "InvalidPartOrder")
 }
 
+// AbortMultipartUpload ends the upload; ListParts is then NoSuchUpload.
 func testAbortMultipartUpload(ctx context.Context, env *Env) TestResult {
 	key := "mpu-abort"
 	create, err := env.Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
@@ -180,6 +263,10 @@ func testAbortMultipartUpload(ctx context.Context, env *Env) TestResult {
 	})
 	if err != nil {
 		return Error("create: " + err.Error())
+	}
+	if _, err := uploadPart(ctx, env, key, create.UploadId, 1, 'x'); err != nil {
+		abortUpload(ctx, env, key, create.UploadId)
+		return Error("upload: " + err.Error())
 	}
 
 	_, err = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
@@ -190,7 +277,10 @@ func testAbortMultipartUpload(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	return Pass()
+	_, err = env.Client.ListParts(ctx, &s3.ListPartsInput{
+		Bucket: aws.String(env.Bucket), Key: aws.String(key), UploadId: create.UploadId,
+	})
+	return expectFailure(err, "ListParts after abort", 404, "NoSuchUpload")
 }
 
 func testListMultipartUploads(ctx context.Context, env *Env) TestResult {
@@ -202,13 +292,7 @@ func testListMultipartUploads(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Error("create: " + err.Error())
 	}
-	defer func() {
-		_, _ = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(env.Bucket),
-			Key:      aws.String(key),
-			UploadId: create.UploadId,
-		})
-	}()
+	defer abortUpload(ctx, env, key, create.UploadId)
 
 	out, err := env.Client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
 		Bucket: aws.String(env.Bucket),
@@ -216,36 +300,23 @@ func testListMultipartUploads(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Fail(err.Error())
 	}
-	found := false
 	for _, u := range out.Uploads {
-		if aws.ToString(u.Key) == key {
-			found = true
-			break
+		if aws.ToString(u.Key) == key && aws.ToString(u.UploadId) == aws.ToString(create.UploadId) {
+			return Pass()
 		}
 	}
-	if !found {
-		return Fail("upload not found in list")
-	}
-	return Pass()
+	return Fail("upload not found in list")
 }
 
+// UploadPartCopy copies a part from an existing object; the completed object
+// has the source bytes.
 func testUploadPartCopy(ctx context.Context, env *Env) TestResult {
-	// Need a source object large enough.
 	srcKey := "mpu-copy-src"
 	body := strings.Repeat("x", partSize)
-	_, err := env.Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(env.Bucket),
-		Key:    aws.String(srcKey),
-		Body:   strings.NewReader(body),
-	})
-	if err != nil {
+	if _, err := putBody(ctx, env, env.Bucket, srcKey, body); err != nil {
 		return Error("put source: " + err.Error())
 	}
-	defer func() {
-		_, _ = env.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(env.Bucket), Key: aws.String(srcKey),
-		})
-	}()
+	defer deleteObject(ctx, env, srcKey)
 
 	dstKey := "mpu-copy-dst"
 	create, err := env.Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
@@ -255,11 +326,8 @@ func testUploadPartCopy(ctx context.Context, env *Env) TestResult {
 	if err != nil {
 		return Error("create mpu: " + err.Error())
 	}
-	defer func() {
-		_, _ = env.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-			Bucket: aws.String(env.Bucket), Key: aws.String(dstKey), UploadId: create.UploadId,
-		})
-	}()
+	defer abortUpload(ctx, env, dstKey, create.UploadId)
+	defer deleteObject(ctx, env, dstKey)
 
 	copyOut, err := env.Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
 		Bucket:     aws.String(env.Bucket),
@@ -273,6 +341,24 @@ func testUploadPartCopy(ctx context.Context, env *Env) TestResult {
 	}
 	if copyOut.CopyPartResult == nil || copyOut.CopyPartResult.ETag == nil {
 		return Fail("no ETag in copy result")
+	}
+	_, err = env.Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(env.Bucket),
+		Key:      aws.String(dstKey),
+		UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+			{PartNumber: aws.Int32(1), ETag: copyOut.CopyPartResult.ETag},
+		}},
+	})
+	if err != nil {
+		return Fail("complete: " + err.Error())
+	}
+	got, err := bodyMD5(ctx, env, dstKey)
+	if err != nil {
+		return Fail("read: " + err.Error())
+	}
+	if got != repeatMD5('x', partSize) {
+		return Fail("copied part bytes differ from the source")
 	}
 	return Pass()
 }

@@ -21,11 +21,18 @@ import (
 func main() {
 	providers := flag.String("providers", "", "comma-separated provider names (default: all configured)")
 	output := flag.String("output", "results.json", "path for JSON report")
+	only := flag.String("tests", "", "comma-separated test names to run, in suite order (default: all)")
 	flag.Parse()
 
 	var names []string
 	if *providers != "" {
 		names = strings.Split(*providers, ",")
+	}
+	if *only != "" {
+		onlyTests = map[string]bool{}
+		for _, n := range strings.Split(*only, ",") {
+			onlyTests[strings.TrimSpace(n)] = true
+		}
 	}
 
 	providerList := LoadProviders(names)
@@ -57,6 +64,9 @@ func main() {
 			pr.Name, pr.Passed, pr.Failed, pr.Skipped, pr.Errors, pr.Total)
 	}
 }
+
+// onlyTests, when set by --tests, limits the run to the named tests.
+var onlyTests map[string]bool
 
 func runProvider(ctx context.Context, p *Provider) ProviderReport {
 	pr := ProviderReport{
@@ -98,8 +108,24 @@ func runProvider(ctx context.Context, p *Provider) ProviderReport {
 		Region:        p.Region,
 	}
 
+	// A second bucket with versioning on, for the versioning category. The
+	// provider decides how it is created; when that fails the category skips.
+	versioned := bucket + "-v"
+	if err := p.CreateVersionedBucket(ctx, client, versioned); err != nil {
+		fmt.Printf("No versioned bucket (%s): versioning tests will skip\n", err)
+		env.VersionedBucketErr = err.Error()
+		_, _ = client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(versioned)})
+	} else {
+		fmt.Printf("Using versioned bucket: %s\n", versioned)
+		env.VersionedBucket = versioned
+		defer cleanupBucket(ctx, client, versioned)
+	}
+
 	allTests := tests.All()
 	for _, t := range allTests {
+		if onlyTests != nil && !onlyTests[t.Name] {
+			continue
+		}
 		start := time.Now()
 		result := t.Fn(ctx, env)
 		result.Operation = t.Name
@@ -118,6 +144,8 @@ func runProvider(ctx context.Context, p *Provider) ProviderReport {
 		msg := result.Operation
 		if result.Error != "" {
 			msg += ": " + result.Error
+		} else if result.Notes != "" {
+			msg += " (" + result.Notes + ")"
 		}
 		fmt.Printf("  %s %s\n", symbol, msg)
 
@@ -130,9 +158,8 @@ func runProvider(ctx context.Context, p *Provider) ProviderReport {
 
 func cleanupBucket(ctx context.Context, client *s3.Client, bucket string) {
 	// Delete all object versions and delete markers first. Versioned buckets
-	// (e.g. AWS S3 after enabling versioning in the test suite) will not
-	// delete unless every version is removed by VersionId. Providers that
-	// do not support versioning return an empty list here.
+	// will not delete unless every version is removed by VersionId. Providers
+	// that do not support versioning return an empty list here.
 	versionsPaginator := s3.NewListObjectVersionsPaginator(client, &s3.ListObjectVersionsInput{
 		Bucket: aws.String(bucket),
 	})
