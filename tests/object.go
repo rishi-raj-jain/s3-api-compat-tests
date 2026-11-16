@@ -482,6 +482,37 @@ func testRenameObjectSourceIsLiteralKey(ctx context.Context, env *Env) TestResul
 	if _, err := headObject(ctx, env, src); err != nil {
 		return Fail("source removed by a rename that named another key: " + err.Error())
 	}
+
+	// A key that really starts with the bucket name is renamed by that same
+	// value: the prefix is part of the key, not a qualifier.
+	prefixed := env.Bucket + "/" + src
+	if _, err := putBody(ctx, env, env.Bucket, prefixed, "prefixed"); err != nil {
+		return Error("setup: " + err.Error())
+	}
+	defer deleteObject(ctx, env, prefixed)
+
+	_, err := env.Client.RenameObject(ctx, &s3.RenameObjectInput{
+		Bucket:       aws.String(env.Bucket),
+		Key:          aws.String(dst),
+		RenameSource: aws.String(prefixed),
+	})
+	if err != nil {
+		return Fail("rename from the existing key " + prefixed + ": " + err.Error())
+	}
+	_, err = headObject(ctx, env, prefixed)
+	if r := expectFailure(err, "HeadObject of the renamed prefixed key", 404, "NotFound", "NoSuchKey"); r.Status != StatusPass {
+		return r
+	}
+	body, err := getObjectBody(ctx, env, dst)
+	if err != nil {
+		return Fail("get destination: " + err.Error())
+	}
+	if body != "prefixed" {
+		return Fail("renamed the wrong object: destination does not have the prefixed key's body")
+	}
+	if _, err := headObject(ctx, env, src); err != nil {
+		return Fail("bare key removed by a rename of the prefixed key: " + err.Error())
+	}
 	return Pass()
 }
 
