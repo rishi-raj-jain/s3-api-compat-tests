@@ -30,6 +30,7 @@ func ObjectTests() []TestDef {
 		{"CopyObject_MultipartSource", "object", testCopyObjectMultipartSource},
 		{"RenameObject", "object", testRenameObject},
 		{"RenameObject_IfNoneMatch", "object", testRenameObjectIfNoneMatch},
+		{"RenameObject_SourceIsLiteralKey", "object", testRenameObjectSourceIsLiteralKey},
 		{"GetObject_Range", "object", testGetObjectRange},
 		{"GetObject_IfMatch", "object", testGetObjectIfMatch},
 		{"GetObject_IfNoneMatch", "object", testGetObjectIfNoneMatch},
@@ -392,7 +393,8 @@ func testCopyObjectMultipartSource(ctx context.Context, env *Env) TestResult {
 }
 
 // RenameObject moves the key: the source is gone and the destination has the
-// body. The SDK sends a client token with the request.
+// body. The SDK sends a client token with the request. x-amz-rename-source is
+// the source key alone, URL-encoded.
 func testRenameObject(ctx context.Context, env *Env) TestResult {
 	src := "test-rename-src"
 	dst := "test-rename-dst"
@@ -405,7 +407,7 @@ func testRenameObject(ctx context.Context, env *Env) TestResult {
 	_, err := env.Client.RenameObject(ctx, &s3.RenameObjectInput{
 		Bucket:       aws.String(env.Bucket),
 		Key:          aws.String(dst),
-		RenameSource: aws.String("/" + env.Bucket + "/" + src),
+		RenameSource: aws.String(src),
 	})
 	if err != nil {
 		return Fail(err.Error())
@@ -440,7 +442,7 @@ func testRenameObjectIfNoneMatch(ctx context.Context, env *Env) TestResult {
 	_, err := env.Client.RenameObject(ctx, &s3.RenameObjectInput{
 		Bucket:                 aws.String(env.Bucket),
 		Key:                    aws.String(dst),
-		RenameSource:           aws.String("/" + env.Bucket + "/" + src),
+		RenameSource:           aws.String(src),
 		DestinationIfNoneMatch: aws.String("*"),
 	})
 	if r := expectFailure(err, "rename onto an existing key with If-None-Match: *", 412, "PreconditionFailed"); r.Status != StatusPass {
@@ -452,6 +454,33 @@ func testRenameObjectIfNoneMatch(ctx context.Context, env *Env) TestResult {
 	}
 	if _, err := headObject(ctx, env, src); err != nil {
 		return Fail("source removed although the condition failed: " + err.Error())
+	}
+	return Pass()
+}
+
+// The decoded x-amz-rename-source is the source key, literally: a leading slash
+// or the bucket name in front of it names a different key, which does not exist.
+func testRenameObjectSourceIsLiteralKey(ctx context.Context, env *Env) TestResult {
+	src := "test-rename-literal-src"
+	dst := "test-rename-literal-dst"
+	if err := putTestObject(ctx, env, src); err != nil {
+		return Error("setup: " + err.Error())
+	}
+	defer deleteObject(ctx, env, src)
+	defer deleteObject(ctx, env, dst)
+
+	for _, source := range []string{"/" + src, env.Bucket + "/" + src, "/" + env.Bucket + "/" + src} {
+		_, err := env.Client.RenameObject(ctx, &s3.RenameObjectInput{
+			Bucket:       aws.String(env.Bucket),
+			Key:          aws.String(dst),
+			RenameSource: aws.String(source),
+		})
+		if r := expectFailure(err, "rename from "+source, 404, "NoSuchKey"); r.Status != StatusPass {
+			return r
+		}
+	}
+	if _, err := headObject(ctx, env, src); err != nil {
+		return Fail("source removed by a rename that named another key: " + err.Error())
 	}
 	return Pass()
 }
